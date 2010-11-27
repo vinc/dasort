@@ -8,6 +8,5 @@ setup(name='DaSort',
     author='Vincent Ollivier',
     author_email='contact@vincentollivier.com',
     url='https://github.com/vinc/dasort',
-    packages=['dasort'],
     scripts=['scripts/dasort']
 )
