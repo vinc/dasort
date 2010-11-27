@@ -1,0 +1,196 @@
+#!/usr/bin/env python
+#
+# Copyright (C) 2010 Vincent Ollivier <contact@vincentollivier.com>
+#
+# This file is part of DaSort.
+#
+# DaSort is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+import curses
+import os
+import os.path
+import shutil
+import sys
+
+from xml.dom.minidom import parse
+from datetime import datetime
+
+import argparse
+import pyexiv2
+
+def _progress_bar(i, n, size):
+    """Return a (beautiful) progress bar."""
+    arrow = 1 if i % n else 0
+    elems = 3 if i % n else 2
+    done = int(round(i * (size - elems) / float(n)))
+    todo = size - elems - done
+    return ''.join(['[', '=' * done, '>' * arrow, ' ' * todo, ']'])
+
+def progression(i, n, size):
+    """Return printable representation about the progression."""
+    sep = ' '
+    percent = '%d%%' % (i * 100 / n)
+    progress = _progress_bar(i, n, size - len(percent) - (len(sep) * 3))
+    return ''.join([sep, percent, sep, progress, sep])
+    
+
+def main(screen_width):
+    """Import pictures from source to destination."""
+    # TODO add --quiet
+    parser = argparse.ArgumentParser(description='Sort pictures by date.')
+    parser.add_argument('source')
+    parser.add_argument('destination')
+    parser.add_argument('--format', default='%Y/%m/%d', 
+			help='set the tree arborescence')
+    parser.add_argument('-s', '--symbolic', action='store_true',
+			help='make symbolic links instead of copy')
+    args = parser.parse_args()
+    
+    # Find absolute directories
+    source = os.path.expanduser(args.source)
+    destination = os.path.expanduser(args.destination)
+
+    print "Scanning '%s' ..." % source
+    sys.stdout.flush()
+    total = 0
+    for root, dirs, files in os.walk(source):
+	for filename in files:
+	    total += 1
+
+    print 'Examining %d files ...\n' % total
+    sys.stdout.write('\r%s' % progression(i, total, screen_width))
+    sys.stdout.flush()
+    imported = 0
+    duplicated = 0
+    ignored_files = []
+    for root, dirs, files in os.walk(source):
+	for filename in files:
+	    i += 1
+	    if i % (total / 100) == 0:
+		sys.stdout.write('\r%s' % progression(i, total, screen_width))
+		sys.stdout.flush()
+	    old_path = os.path.join(root, filename)
+	    try:
+		metadata = pyexiv2.ImageMetadata(old_path)
+	    except UnicodeDecodeError, e:
+		# Error in filename
+		ignored_files.append(old_path)
+		continue
+	    try:
+		# FIXME useless error and warning are printed
+		# redirecting stderr to /dev/null doesn't work
+		# Need pyexiv2 > revision 325 to solve this problem
+		# https://bugs.launchpad.net/pyexiv2/+bug/507620
+		sys.stderr = open('/dev/null', 'w')
+		metadata.read()
+		sys.stderr = sys.__stderr__
+	    except IOError, e:
+		# Unknown image type
+		ignored_files.append(old_path)
+		continue
+	    
+	    # Find the date of creation
+	    date = None
+	    if 'Exif.Photo.DateTimeOriginal' in metadata:
+		date = metadata['Exif.Photo.DateTimeOriginal'].value
+	    elif 'Exif.Image.DateTime' in metadata:
+		date = metadata['Exif.Image.DateTime'].value
+	    elif filename.split('.')[-1] == 'ufraw':
+		dom = parse(old_path)
+		for ts in dom.getElementsByTagName('Timestamp'): 
+		    date = datetime.strptime(ts.firstChild.nodeValue, '%c')
+	    
+	    # Find location in destination from date
+	    try:
+		dirname = date.strftime(args.format)
+	    except:
+		dirname = 'noexif'
+	    basename = os.path.join(destination, dirname)
+
+	    # Create location
+	    try:
+		os.makedirs(basename)
+	    except OSError, e:
+		if e.errno == 17:
+		    # Directory already exist
+		    pass
+		else:
+		    raise
+	    
+	    # Find if a file is already here
+	    new_path = '%s/%s' % (basename, filename)
+	    if os.path.isfile(new_path):
+		file_size = os.path.getsize(old_path)
+		dup_size = os.path.getsize(new_path)
+		if file_size == dup_size:
+		    # Same sizes => Same files
+		    duplicated += 1
+		    continue
+		else:
+		    # Different sizes => Different versions
+		    # Backup the newer version to backup_path
+		    # Store the older at new_path
+		    old_file_time = os.path.getctime(new_path)
+		    new_file_time = os.path.getctime(old_path)
+		    j = 0
+		    while os.path.isfile('%s.new%d' % (new_path, j)):
+			j += 1
+		    backup_path = '%s.new%d' % (new_path, j)
+		    if new_file_time > old_file_time:
+			shutil.move(new_path, backup_path)
+		    else:
+			new_path = backup_path
+
+	    # Store the file in location
+	    if args.symbolic:
+		# Only create a symbolic link
+		os.symlink(old_path, new_path)
+	    else:
+		# Copy the file and its metadata
+		shutil.copy2(old_path, new_path)
+	    imported += 1
+    
+    # Import completed
+    sys.stdout.write('\r%s\n\n' % progression(i, total, screen_width))
+    sys.stdout.flush()
+    print '%d of %d files imported' % (imported, total)
+    print '%d duplicated pictures ignored' % duplicated
+    print "%d files ignored (listed in 'ignored.txt')" % len(ignored_files)
+    
+    # Export ignored files list
+    with open(os.path.join(destination, 'ignored.txt'), 'a') as f:
+	f.write(datetime.now().strftime('[%c]'))
+	f.write(" Not imported from '%s': \n" % source)
+	for ignored_file in ignored_files:
+	    f.write('%s\n' % ignored_file)
+    
+if __name__ == '__main__':
+    # Find the screen width using Curses
+    window = curses.initscr()
+    screen_width = window.getmaxyx()[1]
+    curses.endwin()
+
+    # Hide cursor for progress bar
+    curses.curs_set(0)
+
+    # Execute main function
+    try:
+	main(screen_width)
+    except KeyboardInterrupt:
+	# Clean the progress bar's line
+	print
+	sys.exit(1)
+    finally:
+	# Don't forget to display cursor again!
+	curses.curs_set(1)
