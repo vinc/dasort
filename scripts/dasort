@@ -69,6 +69,7 @@ def main(screen_width):
 	    total += 1
 
     print 'Examining %d files ...\n' % total
+    i = 0
     sys.stdout.write('\r%s' % progression(i, total, screen_width))
     sys.stdout.flush()
     imported = 0
